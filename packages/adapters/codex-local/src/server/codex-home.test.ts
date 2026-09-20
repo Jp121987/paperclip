@@ -1,6 +1,8 @@
+import { execFile as execFileCallback, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CODEX_SYNC_ALLOWLIST,
@@ -1023,7 +1025,11 @@ describe("evaluateCodexCredentialReadiness", () => {
       const alpha = await fs.readFile(path.join(alphaHome, "config.toml"), "utf8");
       const zero = await fs.readFile(path.join(zeroHome, "config.toml"), "utf8");
       expect(alpha).toContain('[mcp_servers."alpha"]');
-      expect(alpha).toContain('Authorization = "Bearer alpha-token"');
+      // Codex's MCP server config key is `http_headers` (its TOML schema has no
+      // plain `headers`); writing `headers` makes codex silently ignore the
+      // server, so every governed gateway vanishes from the agent's toolset.
+      expect(alpha).toContain('http_headers = { Authorization = "Bearer alpha-token" }');
+      expect(alpha).not.toMatch(/\n\s*headers = /);
       expect(zero).not.toContain("mcp_servers.");
       expect(zero).not.toContain("stale-token");
       expect(alphaHome).not.toBe(zeroHome);
@@ -1049,6 +1055,85 @@ describe("evaluateCodexCredentialReadiness", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+});
+
+// Managed gateway auth must land under the key the codex CLI actually reads.
+// Codex (>= 0.155 verified) reads `mcp_servers.<name>.http_headers`; a bare
+// `headers` key parses without error and is silently dropped, so every
+// governed gateway call went out unauthenticated. The generated-file contract
+// is asserted above (writeManagedCodexMcpConfig, `http_headers = …`); this
+// case asks the real installed codex binary to load the generated config and
+// report what it recognized (`codex mcp get --json` is a pure config read: no
+// network, no auth.json, no model call — ~20 ms). Skipped when no codex binary
+// is available (PAPERCLIP_TEST_CODEX_COMMAND, then `codex` on PATH, then the
+// macOS ChatGPT-bundled CLI).
+describe("managed MCP gateway auth is consumable by codex", () => {
+  const execFile = promisify(execFileCallback);
+  const DUMMY_TOKEN = "dummy-gateway-token-not-a-secret";
+
+  function resolveCodexCommand(): string | null {
+    const candidates = [
+      process.env.PAPERCLIP_TEST_CODEX_COMMAND,
+      "codex",
+      process.platform === "darwin" ? "/Applications/ChatGPT.app/Contents/Resources/codex" : null,
+    ].filter((candidate): candidate is string => Boolean(candidate));
+    for (const candidate of candidates) {
+      const probe = spawnSync(candidate, ["--version"], { encoding: "utf8", timeout: 10_000 });
+      if (probe.status === 0 && /codex/i.test(probe.stdout)) return candidate;
+    }
+    return null;
+  }
+  const codexCommand = resolveCodexCommand();
+
+  async function codexMcpGet(codexHome: string, name: string): Promise<{
+    transport: { http_headers: Record<string, string> | null };
+  }> {
+    const { stdout } = await execFile(codexCommand as string, ["mcp", "get", name, "--json"], {
+      env: { ...process.env, CODEX_HOME: codexHome },
+      timeout: 15_000,
+    });
+    return JSON.parse(stdout);
+  }
+
+  it.skipIf(codexCommand === null)(
+    "the installed codex CLI loads the generated Authorization header and drops the old headers key",
+    async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-mcp-read-"));
+      try {
+        // Starting state: Paperclip generated a managed gateway with a dummy credential.
+        const generatedHome = path.join(root, "generated");
+        await writeManagedCodexMcpConfig({
+          codexHome: generatedHome,
+          apiBaseUrl: "https://paperclip.example",
+          gateways: [{ name: "projects", endpointPath: "/api/mcp/project-tools", bearerToken: DUMMY_TOKEN }],
+        });
+
+        // Action: native codex loads that config. Result: the bearer token is
+        // recognized as HTTP authorization material for the gateway.
+        const generated = await codexMcpGet(generatedHome, "projects");
+        expect(generated.transport.http_headers).toEqual({ Authorization: `Bearer ${DUMMY_TOKEN}` });
+
+        // Negative control: the pre-fix key shape is what codex ignores, so
+        // this observer really does distinguish lost auth from kept auth.
+        const legacyHome = path.join(root, "legacy");
+        await fs.mkdir(legacyHome, { recursive: true });
+        await fs.writeFile(
+          path.join(legacyHome, "config.toml"),
+          [
+            '[mcp_servers."projects"]',
+            'url = "https://paperclip.example/api/mcp/project-tools"',
+            `headers = { Authorization = "Bearer ${DUMMY_TOKEN}" }`,
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+        const legacy = await codexMcpGet(legacyHome, "projects");
+        expect(legacy.transport.http_headers).toBeNull();
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("stageCodexHomeForSync", () => {
@@ -1154,7 +1239,7 @@ describe("stageCodexHomeForSync", () => {
       // and is persisted 0600 on disk.
       await fs.writeFile(
         path.join(home, "config.toml"),
-        "[mcp_servers.paperclip]\nheaders = { Authorization = \"Bearer secret-token\" }\n",
+        "[mcp_servers.paperclip]\nhttp_headers = { Authorization = \"Bearer secret-token\" }\n",
         { mode: 0o600 },
       );
       staged = await stageCodexHomeForSync(home, { runId: "run-toml-mode" });

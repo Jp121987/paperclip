@@ -92,6 +92,17 @@ function processMayBeAlive(pid: number): boolean {
   }
 }
 
+export const ENVIRONMENT_LEASE_RELEASE_PENDING =
+  "The previous execution has not released its environment lease. Wait for cleanup before continuing this task.";
+
+/** The stopped run's own cleanup clears this hold; no provider process is alive. */
+export function isEnvironmentLeaseReleaseHold(
+  blocker: { recoveryActionId: string | null; cause: string; nextAction: string } | null | undefined,
+): boolean {
+  return Boolean(blocker && blocker.recoveryActionId === null && blocker.cause === "execution_owner_active" &&
+    blocker.nextAction === ENVIRONMENT_LEASE_RELEASE_PENDING);
+}
+
 /** A terminal conversation row does not prove that its execution authority ended.
  * Other adapters keep their existing bootstrap and ownership protocols.
  */
@@ -126,7 +137,7 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
         cause: "execution_owner_active",
         nextAction: pidAlive || groupAlive
           ? "The previous provider process is still running. Stop it before continuing this task."
-          : "The previous execution has not released its environment lease. Wait for cleanup before continuing this task.",
+          : ENVIRONMENT_LEASE_RELEASE_PENDING,
       };
     }
   }

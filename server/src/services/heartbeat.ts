@@ -12,7 +12,7 @@ import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
-import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
+import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter, isEnvironmentLeaseReleaseHold } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
@@ -10446,6 +10446,70 @@ export function heartbeatService(
     }
   }
 
+  // Replay wakes parked behind a stopped run's unreleased environment lease
+  // once that hold clears. Ordinary admission re-reads every gate, including
+  // process ownership and the issue execution lock, so a wake still held
+  // parks again and two executions never share the task.
+  async function readmitEnvironmentLeaseWaits(companyId: string, issueId: string) {
+    if (!isUuidLike(issueId) || (await getSchedulingSuppression()).suppressed) return;
+    const parked = await db.transaction(async (tx) => {
+      // Admission parks under this issue lock. Waiting on it means a wake
+      // parked just before the lease release is visible here.
+      await tx.execute(sql`select id from issues where id = ${issueId} and company_id = ${companyId} for update`);
+      return tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+        sql`${agentWakeupRequests.payload}->'executionWait'->>'leaseHeldByRunId' is not null`,
+      )).orderBy(asc(agentWakeupRequests.requestedAt)).limit(50);
+    });
+    if (parked.length === 0) return;
+    if (isEnvironmentLeaseReleaseHold(await getExecutionBlocker(db, companyId, issueId))) {
+      // Still held. Advance the periodic scan cursor so other tasks get a turn.
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        inArray(agentWakeupRequests.id, parked.map((wake) => wake.id)),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      return;
+    }
+    for (const wake of parked) {
+      // Retire the parked receipt first, so exactly one caller replays it.
+      const now = new Date();
+      const [claimed] = await db.update(agentWakeupRequests)
+        .set({ status: "coalesced", finishedAt: now, updatedAt: now })
+        .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution")))
+        .returning();
+      if (!claimed) continue;
+      const payload = { ...parseObject(claimed.payload) };
+      const contextSnapshot = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+      const wait = parseObject(payload.executionWait);
+      delete payload[DEFERRED_WAKE_CONTEXT_KEY];
+      delete payload.executionWait;
+      try {
+        const replayed = await enqueueWakeup(claimed.agentId, {
+          source: claimed.source as WakeupOptions["source"],
+          triggerDetail: (claimed.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
+          reason: claimed.reason, payload, contextSnapshot,
+          requestedByActorType: (claimed.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+          requestedByActorId: claimed.requestedByActorId,
+          ...(Object.keys(parseObject(wait.issueStateGuard)).length > 0
+            ? { issueStateGuard: wait.issueStateGuard as WakeupOptions["issueStateGuard"] } : {}),
+          ...(wait.allowRunCoalescing === false ? { allowRunCoalescing: false } : {}),
+        });
+        if (replayed) {
+          await db.update(agentWakeupRequests).set({ runId: replayed.id, updatedAt: new Date() }).where(and(
+            eq(agentWakeupRequests.id, claimed.id), eq(agentWakeupRequests.companyId, companyId),
+          ));
+        }
+      } catch (err) {
+        logger.warn({ err, wakeupRequestId: claimed.id, issueId },
+          "failed to replay a wake parked behind an environment lease");
+      }
+    }
+  }
+
   async function hasUnsafeTextProjectionDatabase() {
     if (!unsafeTextProjectionPromise) {
       unsafeTextProjectionPromise = db
@@ -19267,6 +19331,22 @@ export function heartbeatService(
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
+    // A restart or a cleanup-sweep release can clear a lease with no executor
+    // left to replay the wakes parked behind it.
+    const leaseWaits = await db.select({ companyId: agentWakeupRequests.companyId, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .innerJoin(companies, and(eq(companies.id, agentWakeupRequests.companyId), eq(companies.status, "active")))
+      .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->'executionWait'->>'leaseHeldByRunId' is not null`,
+        lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000))))
+      .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
+    const leaseWaitIssues = new Map(leaseWaits.map((wait) => [`${wait.companyId}:${String(wait.payload?.issueId)}`,
+      { companyId: wait.companyId, issueId: String(wait.payload?.issueId) }]));
+    for (const { companyId, issueId } of leaseWaitIssues.values()) {
+      await readmitEnvironmentLeaseWaits(companyId, issueId).catch(err => {
+        logger.warn({ err, issueId }, "failed to replay wakes parked behind an environment lease");
+      });
+    }
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
@@ -25975,6 +26055,14 @@ export function heartbeatService(
           : releaseIssueExecutionAndPromote(latestRun, { suppressImmediateRecovery: true })).catch(err => {
           logger.error({ err, runId: run.id }, "failed to promote legacy comment queue after cleanup");
         });
+        // The next participant's wake, for example a stage handoff, may have
+        // parked behind this run's lease; that lease is released by now.
+        const leaseIssueId = latestRun.nativeIssueId ?? readNonEmptyString(latestRun.contextSnapshot?.issueId);
+        if (leaseIssueId && !shutdownInProgress) {
+          await readmitEnvironmentLeaseWaits(run.companyId, leaseIssueId).catch(err => {
+            logger.warn({ err, runId: run.id }, "failed to replay wakes parked behind the released environment lease");
+          });
+        }
       }
       if (
         !nativeSessionResumeScheduled &&
@@ -26940,9 +27028,25 @@ export function heartbeatService(
               }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
               return { kind: "deferred" as const };
             }
-            if (durableRequest || wakeCommentId ||
+            const keepsReceipt = Boolean(durableRequest || wakeCommentId ||
                 hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
-                readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId)) {
+                readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId));
+            // A stopped run holds the task only until its own cleanup releases
+            // its environment lease, seconds later. A diagnostic skip would
+            // lose this wake (a stage handoff has no other sender), so park it
+            // for `readmitEnvironmentLeaseWaits` to replay through admission.
+            // Keyed deliveries and user wakes keep their own retry paths.
+            const leaseReleaseWait = !keepsReceipt && opts.requestedByActorType !== "user" &&
+              !opts.idempotencyKey && !executionReconciliationWake &&
+              isEnvironmentLeaseReleaseHold(executionBlocker) && executionBlocker.runId
+              ? {
+                  reason: "environment_lease_release", message: executionBlocker.nextAction,
+                  leaseHeldByRunId: executionBlocker.runId,
+                  ...(opts.issueStateGuard ? { issueStateGuard: opts.issueStateGuard } : {}),
+                  ...(opts.allowRunCoalescing === false ? { allowRunCoalescing: false } : {}),
+                }
+              : null;
+            if (keepsReceipt || leaseReleaseWait) {
               await tx.insert(agentWakeupRequests).values({
                 ...durableReceiptFields,
                 companyId: agent.companyId, agentId, source, triggerDetail, reason,
@@ -26950,7 +27054,7 @@ export function heartbeatService(
                   ...payload,
                   issueId: issue.id,
                   [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
-                  executionWait: condition,
+                  executionWait: { ...condition, ...leaseReleaseWait },
                 }, [...new Set([
                   ...queuedCommentIdsFromRunContext(enrichedContextSnapshot),
                   ...(wakeCommentId ? [wakeCommentId] : []),

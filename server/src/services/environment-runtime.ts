@@ -1190,6 +1190,29 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
       return await environmentsSvc.releaseLease(input.lease.id, input.status);
     },
 
+    // An SSH lease reserves no provider resource. Acquire only ensures the
+    // configured remote workspace exists, and that path is shared by every
+    // lease on the environment, so there is nothing remote to tear down.
+    // Destroy settles the row the way a successful sandbox teardown does, so
+    // the cleanup sweep stops retrying it and the stopped run no longer holds
+    // the task through a `pending_cleanup` or failed-cleanup lease.
+    async destroyRunLease(input) {
+      const metadata = input.lease.metadata ?? {};
+      return await environmentsSvc.releaseLease(input.lease.id, "expired", {
+        ...(input.lease.status === "pending_cleanup" && typeof metadata.pendingCleanupAttemptId === "string"
+          ? { expectedPendingCleanupAttemptId: metadata.pendingCleanupAttemptId } : {}),
+        failureReason: input.failureReason ?? "lease_destroyed",
+        cleanupStatus: "success",
+      });
+    },
+
+    // SSH leases are ephemeral, so the pending-cleanup sweep settles them
+    // through the recorded-teardown path. With no provider resource there is
+    // no teardown and no provider receipt; the sweep then releases the row.
+    async retryPendingSandboxTeardown() {
+      return null;
+    },
+
     async realizeWorkspace(input) {
       const record = buildWorkspaceRealizationRecordFromDriverInput({
         environment: input.environment,

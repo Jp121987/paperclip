@@ -165,7 +165,13 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
     ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"],
     { cwd: destinationDir, stdio: "inherit" },
   );
-  writeFileSync(deployedPackagePath, `${JSON.stringify(publishManifest, null, 2)}\n`);
+  // The staged package is already built; pack/publish hooks such as `prepack`
+  // would try to rebuild it outside the workspace and fail.
+  const stagedManifest = structuredClone(publishManifest);
+  for (const hook of ["prepack", "prepare", "prepublish", "prepublishOnly", "postpack"]) {
+    if (stagedManifest.scripts) delete stagedManifest.scripts[hook];
+  }
+  writeFileSync(deployedPackagePath, `${JSON.stringify(stagedManifest, null, 2)}\n`);
   applyBundledDependencyPatches(destinationDir, bundledDependencies, sourceRoot);
 
   if (bundledDependencies.includes("acpx")) {

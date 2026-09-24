@@ -78,3 +78,6 @@ tests/storybook-visual/playwright-report/
 .vercel/
 .env.local
 test-results/
+
+# Copied from ../skills by the server build for packaging (files: skills)
+server/skills/

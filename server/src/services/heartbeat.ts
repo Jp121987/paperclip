@@ -3656,6 +3656,14 @@ interface WakeupOptions {
   allowRunCoalescing?: boolean;
 }
 
+/**
+ * Internal replay of a wake parked behind a stopped run's environment lease.
+ * Admission retires the parked receipt inside the same transaction that
+ * decides it, so the receipt and its delivery commit together or not at all.
+ * `reachedAdmission` tells the caller whether that transaction took over.
+ */
+type LeaseWaitReplay = { requestId: string; reachedAdmission: boolean };
+
 type UsageTotals = {
   inputTokens: number;
   cachedInputTokens: number;
@@ -10449,7 +10457,8 @@ export function heartbeatService(
   // Replay wakes parked behind a stopped run's unreleased environment lease
   // once that hold clears. Ordinary admission re-reads every gate, including
   // process ownership and the issue execution lock, so a wake still held
-  // parks again and two executions never share the task.
+  // stays parked and two executions never share the task. Delivery is at
+  // least once: the receipt is retired only by the admission that decides it.
   async function readmitEnvironmentLeaseWaits(companyId: string, issueId: string) {
     if (!isUuidLike(issueId) || (await getSchedulingSuppression()).suppressed) return;
     const parked = await db.transaction(async (tx) => {
@@ -10474,38 +10483,62 @@ export function heartbeatService(
       return;
     }
     for (const wake of parked) {
-      // Retire the parked receipt first, so exactly one caller replays it.
-      const now = new Date();
-      const [claimed] = await db.update(agentWakeupRequests)
-        .set({ status: "coalesced", finishedAt: now, updatedAt: now })
-        .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, companyId),
-          eq(agentWakeupRequests.status, "deferred_issue_execution")))
-        .returning();
-      if (!claimed) continue;
-      const payload = { ...parseObject(claimed.payload) };
+      // The receipt stays parked until admission retires it inside the
+      // transaction that decides it (see `LeaseWaitReplay`). A failure or a
+      // crash before that commit leaves it parked for the next scan, and the
+      // compare-and-set there lets only one concurrent replay take it.
+      const replay: LeaseWaitReplay = { requestId: wake.id, reachedAdmission: false };
+      const stillParked = and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"));
+      const payload = { ...parseObject(wake.payload) };
       const contextSnapshot = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
       const wait = parseObject(payload.executionWait);
       delete payload[DEFERRED_WAKE_CONTEXT_KEY];
       delete payload.executionWait;
       try {
-        const replayed = await enqueueWakeup(claimed.agentId, {
-          source: claimed.source as WakeupOptions["source"],
-          triggerDetail: (claimed.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
-          reason: claimed.reason, payload, contextSnapshot,
-          requestedByActorType: (claimed.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
-          requestedByActorId: claimed.requestedByActorId,
+        const replayed = await enqueueWakeup(wake.agentId, {
+          source: wake.source as WakeupOptions["source"],
+          triggerDetail: (wake.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
+          reason: wake.reason, payload, contextSnapshot,
+          requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+          requestedByActorId: wake.requestedByActorId,
           ...(Object.keys(parseObject(wait.issueStateGuard)).length > 0
             ? { issueStateGuard: wait.issueStateGuard as WakeupOptions["issueStateGuard"] } : {}),
           ...(wait.allowRunCoalescing === false ? { allowRunCoalescing: false } : {}),
-        });
-        if (replayed) {
+        }, undefined, replay);
+        if (!replay.reachedAdmission) {
+          // Decided before the admission transaction (for example on-demand
+          // wakes are off for the agent); admission recorded that decision.
+          const now = new Date();
+          await db.update(agentWakeupRequests)
+            .set({ status: "coalesced", runId: replayed?.id ?? null, finishedAt: now, updatedAt: now })
+            .where(stillParked);
+        } else if (replayed) {
+          // Admission retired the receipt together with this delivery. The
+          // link is a record only; losing it cannot cause a second delivery.
           await db.update(agentWakeupRequests).set({ runId: replayed.id, updatedAt: new Date() }).where(and(
-            eq(agentWakeupRequests.id, claimed.id), eq(agentWakeupRequests.companyId, companyId),
-          ));
+            eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, companyId),
+            isNull(agentWakeupRequests.runId),
+          )).catch((err) => {
+            logger.warn({ err, wakeupRequestId: wake.id, runId: replayed.id },
+              "failed to link a replayed lease wait to its run");
+          });
         }
       } catch (err) {
-        logger.warn({ err, wakeupRequestId: claimed.id, issueId },
+        logger.warn({ err, wakeupRequestId: wake.id, issueId },
           "failed to replay a wake parked behind an environment lease");
+        // A 4xx is admission refusing this wake (for example a paused agent),
+        // the same decision a fresh wake gets. Anything else leaves the receipt
+        // parked; advance the scan cursor so other tasks get a turn first.
+        const now = new Date();
+        const refusal = err instanceof HttpError && err.status >= 400 && err.status < 500 ? err.message : null;
+        await db.update(agentWakeupRequests).set(refusal !== null
+          ? { status: "coalesced", finishedAt: now, error: refusal.slice(0, 1_000), updatedAt: now }
+          : { updatedAt: now })
+          .where(stillParked)
+          .catch((updateErr) => {
+            logger.warn({ err: updateErr, wakeupRequestId: wake.id }, "failed to update a parked lease wait");
+          });
       }
     }
   }
@@ -26102,7 +26135,12 @@ export function heartbeatService(
     }
   }
 
-  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
+  async function enqueueWakeup(
+    agentId: string,
+    opts: WakeupOptions = {},
+    executionWaitRequestId?: string,
+    leaseWaitReplay?: LeaseWaitReplay,
+  ) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
@@ -26649,6 +26687,24 @@ export function heartbeatService(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
 
+          if (leaseWaitReplay) {
+            // Retire the parked receipt in this transaction, so it commits with
+            // whatever admission decides below. An error or crash rolls both
+            // back and the receipt stays parked. Under the issue lock, this
+            // compare-and-set lets one replay (or the release drain) take it.
+            // A task still held by a lease restores it in deferBlockedExecution.
+            leaseWaitReplay.reachedAdmission = true;
+            const retiredAt = new Date();
+            const [retired] = await tx.update(agentWakeupRequests)
+              .set({ status: "coalesced", finishedAt: retiredAt, updatedAt: retiredAt })
+              .where(and(
+                eq(agentWakeupRequests.id, leaseWaitReplay.requestId), eq(agentWakeupRequests.companyId, agent.companyId),
+                eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              ))
+              .returning({ id: agentWakeupRequests.id });
+            if (!retired) return { kind: "deferred" as const };
+          }
+
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
@@ -27046,6 +27102,17 @@ export function heartbeatService(
                   ...(opts.allowRunCoalescing === false ? { allowRunCoalescing: false } : {}),
                 }
               : null;
+            if (leaseWaitReplay && leaseReleaseWait) {
+              // A replay still held by a lease keeps its original receipt
+              // parked for a later scan, instead of writing a second one.
+              await tx.update(agentWakeupRequests).set({
+                status: "deferred_issue_execution", finishedAt: null, updatedAt: new Date(),
+                payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
+                  ${JSON.stringify({ ...condition, ...leaseReleaseWait })}::jsonb)`,
+              }).where(and(eq(agentWakeupRequests.id, leaseWaitReplay.requestId),
+                eq(agentWakeupRequests.companyId, agent.companyId)));
+              return { kind: "deferred" as const };
+            }
             if (keepsReceipt || leaseReleaseWait) {
               await tx.insert(agentWakeupRequests).values({
                 ...durableReceiptFields,
